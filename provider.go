@@ -42,9 +42,11 @@ package singbox
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -56,6 +58,7 @@ import (
 	boxEndpoint "github.com/sagernet/sing-box/adapter/endpoint"
 	boxInbound "github.com/sagernet/sing-box/adapter/inbound"
 	boxOutbound "github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/include"
@@ -167,11 +170,15 @@ func (p *Provider) fetch(ctx context.Context) ([]byte, error) {
 }
 
 // ParseSubscription turns a subscription body into mihomo-style proxy
-// mappings (the common representation the converter consumes). Clash YAML is
-// tried first; anything else falls through to mihomo's V2Ray-style link
-// converter (which also handles base64-encoded lists).
+// mappings (the common representation the converter consumes). Three formats
+// are recognized, in order: Clash YAML (`proxies:` list), native sing-box
+// JSON (`outbounds:` list), and V2Ray-style link lists (which also handles
+// base64-encoded lists).
 func ParseSubscription(body []byte) ([]map[string]any, error) {
 	if mappings, ok := parseClashYAML(body); ok {
+		return mappings, nil
+	}
+	if mappings, ok := parseSingboxJSON(body); ok {
 		return mappings, nil
 	}
 	return convert.ConvertsV2Ray(body)
@@ -202,6 +209,146 @@ func parseClashYAML(body []byte) ([]map[string]any, bool) {
 		out = append(out, m)
 	}
 	return out, len(out) > 0
+}
+
+// parseSingboxJSON extracts a native sing-box config's `outbounds:` list and
+// converts each dialable outbound into a mihomo-style mapping, so the same
+// converter path serves both subscription dialects. Group/abstract entries
+// (selector, urltest, direct, dns, block) have no server to dial and are
+// skipped.
+func parseSingboxJSON(body []byte) ([]map[string]any, bool) {
+	var doc struct {
+		Outbounds []map[string]any `json:"outbounds"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, false
+	}
+	if len(doc.Outbounds) == 0 {
+		return nil, false
+	}
+	out := make([]map[string]any, 0, len(doc.Outbounds))
+	for _, o := range doc.Outbounds {
+		m, ok := singboxToMapping(o)
+		if !ok {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, len(out) > 0
+}
+
+// singboxToMapping converts one native sing-box outbound JSON object into a
+// mihomo proxy mapping. Returns ok=false for non-dialable types (groups,
+// direct/dns/block) and types with no mihomo mapping here.
+func singboxToMapping(o map[string]any) (map[string]any, bool) {
+	typ, _ := o["type"].(string)
+	var mihomoType string
+	switch typ {
+	case "socks":
+		mihomoType = "socks5"
+	case "http", "vmess", "vless", "trojan", "snell", "ssh", "anytls":
+		mihomoType = typ
+	case "shadowsocks":
+		// sing-box calls it "shadowsocks"; mihomo (and the goose protocol
+		// names this plugin registers) call it "ss".
+		mihomoType = "ss"
+	default:
+		return nil, false
+	}
+	m := map[string]any{"type": mihomoType}
+	if name, _ := o["tag"].(string); name != "" {
+		m["name"] = name
+	}
+	if server, _ := o["server"].(string); server != "" {
+		m["server"] = server
+	}
+	switch port := o["server_port"].(type) {
+	case float64:
+		m["port"] = int(port)
+	case string:
+		if p, err := strconv.Atoi(port); err == nil {
+			m["port"] = p
+		}
+	}
+	for src, dst := range map[string]string{
+		"uuid": "uuid", "password": "password", "method": "cipher",
+		"username": "username", "flow": "flow", "psk": "psk",
+	} {
+		if v, _ := o[src].(string); v != "" {
+			m[dst] = v
+		}
+	}
+	if alterID, ok := o["alter_id"].(float64); ok {
+		m["alterId"] = int(alterID)
+	}
+	if version, ok := o["version"].(float64); ok {
+		m["version"] = int(version)
+	}
+	// TLS: sing-box nests under "tls" with enabled/server_name/insecure.
+	if tls, ok := o["tls"].(map[string]any); ok {
+		if enabled, _ := tls["enabled"].(bool); enabled {
+			m["tls"] = true
+		}
+		if sni, _ := tls["server_name"].(string); sni != "" {
+			m["sni"] = sni
+		}
+		if insecure, _ := tls["insecure"].(bool); insecure {
+			m["skip-cert-verify"] = true
+		}
+		if alpn := stringList(tls["alpn"]); len(alpn) > 0 {
+			m["alpn"] = alpn
+		}
+	}
+	// Transport: sing-box nests under "transport" (type + path/headers);
+	// mihomo expects network + ws-opts/grpc-opts.
+	if tr, ok := o["transport"].(map[string]any); ok {
+		switch trType, _ := tr["type"].(string); trType {
+		case "ws":
+			m["network"] = "ws"
+			opts := map[string]any{}
+			if path, _ := tr["path"].(string); path != "" {
+				opts["path"] = path
+			}
+			if ed, ok := tr["max_early_data"].(float64); ok && ed > 0 {
+				opts["max-early-data"] = int(ed)
+				if hdr, _ := tr["early_data_header_name"].(string); hdr != "" {
+					opts["early-data-header-name"] = hdr
+				}
+			}
+			if headers, ok := tr["headers"].(map[string]any); ok && len(headers) > 0 {
+				opts["headers"] = headers
+			}
+			if len(opts) > 0 {
+				m["ws-opts"] = opts
+			}
+		case "grpc":
+			m["network"] = "grpc"
+			if sn, _ := tr["service_name"].(string); sn != "" {
+				m["grpc-opts"] = map[string]any{"grpc-service-name": sn}
+			}
+		case "httpupgrade":
+			m["network"] = "httpupgrade"
+			if path, _ := tr["path"].(string); path != "" {
+				m["ws-opts"] = map[string]any{"path": path}
+			}
+		}
+	}
+	return m, true
+}
+
+// stringList coerces a JSON array of strings.
+func stringList(v any) []string {
+	list, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // ServerKey derives a stable per-proxy key from the mapping's server+port so
@@ -277,14 +424,24 @@ func buildBoxContext() error {
 		return fmt.Errorf("singbox: network manager: %w", err)
 	}
 	service.MustRegister[adapter.NetworkManager](ctx, networkManager)
-	service.MustRegister[adapter.ConnectionManager](ctx, route.NewConnectionManager(logFactory.NewLogger("connection")))
+	connectionManager := route.NewConnectionManager(logFactory.NewLogger("connection"))
+	service.MustRegister[adapter.ConnectionManager](ctx, connectionManager)
+
+	// The route Router satisfies the adapter.Router the network manager
+	// resets on interface changes (ResetNetwork). Register it BEFORE the
+	// start stages run, or a default-interface update mid-start panics on a
+	// nil router. The HTTP client manager is a Router dependency.
+	httpClientManager := httpclient.NewManager(ctx, logFactory.NewLogger("httpclient"), nil, "")
+	service.MustRegister[adapter.HTTPClientManager](ctx, httpClientManager)
+	boxRouter := route.NewRouter(ctx, logFactory, option.RouteOptions{}, option.DNSOptions{})
+	service.MustRegister[adapter.Router](ctx, boxRouter)
 
 	// Default-outbound and local-DNS fallbacks, mirroring box.New: they are
 	// consulted lazily (only when an outbound actually needs them), which is
 	// what makes domain server addresses resolve through the system DNS.
 	outboundManager.Initialize(func() (adapter.Outbound, error) {
 		return outboundRegistry.CreateOutbound(
-			ctx, nil, logFactory.NewLogger("outbound/direct"), "direct", "direct", option.DirectOutboundOptions{},
+			ctx, nil, logFactory.NewLogger("outbound/direct"), "direct", "direct", &option.DirectOutboundOptions{},
 		)
 	})
 	dnsTransportManager.Initialize(func() (adapter.DNSTransport, error) {
@@ -292,6 +449,24 @@ func buildBoxContext() error {
 			ctx, logFactory.NewLogger("dns/local"), "local", "local", &option.LocalDNSServerOptions{},
 		)
 	})
+	// Run the managers' start stages. The DNS transport manager's Initialize
+	// stage materializes the "local" default transport; without it a lookup
+	// that falls through to the default transport dereferences nil and
+	// panics inside sing-box's dns client. The network manager's Initialize
+	// + PostStart stages start the interface monitors and publish the
+	// default interface; without them every dial that binds by
+	// auto-detect fails with "missing default interface".
+	for _, stage := range adapter.ListStartStages {
+		if err := outboundManager.Start(stage); err != nil {
+			return fmt.Errorf("singbox: outbound manager %s: %w", stage, err)
+		}
+		if err := dnsTransportManager.Start(stage); err != nil {
+			return fmt.Errorf("singbox: dns transport manager %s: %w", stage, err)
+		}
+		if err := networkManager.Start(stage); err != nil {
+			return fmt.Errorf("singbox: network manager %s: %w", stage, err)
+		}
+	}
 
 	// Export the registry the outbound factory dials through. include.Context
 	// installed the same instance in the context; the local reference avoids a
