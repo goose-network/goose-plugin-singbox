@@ -1,7 +1,9 @@
 // outbound.go implements the goose outbound protocols "singbox-<type>" for
-// the always-compiled sing-box proxy types. The factory converts a mihomo
-// proxy mapping into sing-box outbound options, creates the outbound through
-// sing-box's registry, and dials targets with a parsed Socksaddr.
+// the sing-box proxy types this build can dial. The factory converts a proxy
+// mapping into sing-box outbound options — mihomo field names when the two
+// projects share them, raw sing-box options under "options" otherwise (tor,
+// shadowtls, and every field mihomo has no name for) — creates the outbound
+// through sing-box's registry, and dials targets with a parsed Socksaddr.
 package singbox
 
 import (
@@ -23,7 +25,7 @@ import (
 
 // supportedTypes are the sing-box outbound types this plugin exposes, all of
 // which compile without sing-box build tags. QUIC protocols (hysteria,
-// hysteria2, tuic) need with_quic and are skipped in subscriptions.
+// hysteria2, tuic) need with_quic — see quic.go/quic_stub.go.
 var supportedTypes = map[string]bool{
 	"socks":       true,
 	"http":        true,
@@ -34,22 +36,32 @@ var supportedTypes = map[string]bool{
 	"snell":       true,
 	"ssh":         true,
 	"anytls":      true,
+	"shadowtls":   true,
+	"tor":         true,
 }
 
 // mihomoToSingboxType maps mihomo proxy type names to sing-box outbound
-// types. Only entries where the wire protocol is actually the same are
-// listed; the rest (ssr, hysteria, wireguard, mieru, ...) have no
-// always-compiled sing-box counterpart and are skipped.
+// types, so both subscription dialects land on one name: a mapping parsed
+// by mihomo's converters (Clash YAML, V2Ray links) uses the mihomo name,
+// while a native sing-box JSON entry already uses the sing-box name (the
+// identity entries below; mihomo never emits "tor"). Only entries where the
+// wire protocol is actually the same are listed; the rest (ssr, wireguard,
+// mieru, ...) have no sing-box counterpart and are skipped.
 var mihomoToSingboxType = map[string]string{
-	"socks5": "socks",
-	"http":   "http",
-	"ss":     "shadowsocks",
-	"vmess":  "vmess",
-	"vless":  "vless",
-	"trojan": "trojan",
-	"snell":  "snell",
-	"ssh":    "ssh",
-	"anytls": "anytls",
+	"socks5":    "socks",
+	"http":      "http",
+	"ss":        "shadowsocks",
+	"vmess":     "vmess",
+	"vless":     "vless",
+	"trojan":    "trojan",
+	"snell":     "snell",
+	"ssh":       "ssh",
+	"anytls":    "anytls",
+	"shadowtls": "shadowtls",
+	"tor":       "tor",
+	"hysteria":  "hysteria",
+	"hysteria2": "hysteria2",
+	"tuic":      "tuic",
 }
 
 func init() {
@@ -58,19 +70,28 @@ func init() {
 	}
 }
 
-// newOutboundFactory returns an OutboundFactory for one sing-box type.
+// newOutboundFactory returns an OutboundFactory for one sing-box type. Two
+// config shapes carry the proxy: cfg["proxy"] is the subscription mapping
+// (mihomo fields, or native options stashed under "options" inside it), and
+// cfg["options"] is raw sing-box options for static configs of the types
+// mihomo has no field names for (tor, shadowtls).
 func newOutboundFactory(typ string) pub.OutboundFactory {
 	return func(cfg map[string]any) (pub.Outbound, error) {
 		raw, ok := cfg["proxy"].(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("singbox %s outbound: missing proxy mapping", typ)
+			if opts, ok := cfg["options"].(map[string]any); ok {
+				raw = map[string]any{"type": typ, "options": opts}
+			}
+		}
+		if raw == nil {
+			return nil, fmt.Errorf("singbox %s outbound: missing proxy mapping or options", typ)
 		}
 		id, _ := cfg["id"].(string)
 		return &Outbound{id: id, proto: "singbox-" + typ, mapping: raw}, nil
 	}
 }
 
-// ProtocolOf maps a mihomo proxy mapping to its goose outbound protocol name
+// ProtocolOf maps a proxy mapping to its goose outbound protocol name
 // ("singbox-<type>"). It returns ok=false for types this build cannot dial.
 func ProtocolOf(m map[string]any) (string, bool) {
 	typ, _ := m["type"].(string)
@@ -78,7 +99,10 @@ func ProtocolOf(m map[string]any) (string, bool) {
 		return "", false
 	}
 	sbType, ok := mihomoToSingboxType[typ]
-	if !ok || !supportedTypes[sbType] {
+	if !ok {
+		return "", false
+	}
+	if !supportedTypes[sbType] && !quicSupported(sbType) {
 		return "", false
 	}
 	return "singbox-" + sbType, true
@@ -172,13 +196,19 @@ func (o *Outbound) DialContext(ctx context.Context, network pub.Network, target 
 	return conn, nil
 }
 
-// serverAddr renders host:port from the mapping.
+// serverAddr renders host:port from the mapping, in either dialect: mihomo
+// fields (server/port), or the native options object (server/server_port),
+// which is where sing-box JSON entries and static tor configs keep it. Tor
+// dials a local daemon, not a server, so it carries no address.
 func serverAddr(m map[string]any) string {
-	host, _ := m["server"].(string)
+	host, port := mappingStr(m, "server"), m["port"]
+	if opts, ok := m["options"].(map[string]any); ok {
+		host, port = mappingStr(opts, "server"), opts["server_port"]
+	}
 	if host == "" {
 		return ""
 	}
-	return net.JoinHostPort(host, fmt.Sprint(m["port"]))
+	return net.JoinHostPort(host, fmt.Sprint(port))
 }
 
 // includeOutboundRegistry returns the outbound registry installed by

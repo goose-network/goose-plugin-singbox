@@ -8,11 +8,13 @@
 //     body with mihomo's converters (Clash YAML `proxies:` lists and
 //     V2Ray-style link lists) into proxy mappings, then converts each
 //     mapping into a sing-box outbound;
-//   - an outbound protocol for the always-compiled sing-box proxy types,
-//     registered under "singbox-<type>" (e.g. "singbox-vmess",
-//     "singbox-trojan", "singbox-shadowsocks"), which dials by creating the
-//     sing-box outbound via its registry and calling DialContext with a
-//     parsed Socksaddr destination.
+//   - an outbound protocol per dialable sing-box proxy type, registered
+//     under "singbox-<type>" (e.g. "singbox-vmess", "singbox-trojan",
+//     "singbox-shadowsocks"): socks, http, shadowsocks, vmess, vless,
+//     trojan, snell, ssh, anytls, shadowtls and tor always compile;
+//     hysteria, hysteria2 and tuic need goose built with -tags with_quic.
+//     Each dials by creating the sing-box outbound via its registry and
+//     calling DialContext with a parsed Socksaddr destination.
 //
 // # Why a shared sing-box context
 //
@@ -30,7 +32,11 @@
 // The provider stores the raw proxy mapping under cfg["proxy"], and the
 // outbound factory converts it to sing-box options and creates the
 // outbound lazily (on first dial, under a lock), so building a pool of
-// hundreds of proxies costs no connections up front.
+// hundreds of proxies costs no connections up front. Mappings use mihomo's
+// field names where the two projects share them, and carry the raw
+// sing-box options object under "options" where mihomo has no schema (tor,
+// shadowtls, and QUIC/hysteria fields with no mihomo spelling) — static
+// configs can pass that object directly as cfg["options"].
 //
 // # Provider config
 //
@@ -238,8 +244,12 @@ func parseSingboxJSON(body []byte) ([]map[string]any, bool) {
 }
 
 // singboxToMapping converts one native sing-box outbound JSON object into a
-// mihomo proxy mapping. Returns ok=false for non-dialable types (groups,
-// direct/dns/block) and types with no mihomo mapping here.
+// proxy mapping. Types mihomo shares field names with are flattened into the
+// mihomo dialect so one converter path serves both subscription dialects;
+// types mihomo has no fields for (shadowtls, tor, and the QUIC trio) pass
+// the raw object through under "options" instead. Returns ok=false for
+// non-dialable entries: groups (selector, urltest), abstract outbounds
+// (direct, dns, block), and — without with_quic — the QUIC types.
 func singboxToMapping(o map[string]any) (map[string]any, bool) {
 	typ, _ := o["type"].(string)
 	var mihomoType string
@@ -252,6 +262,16 @@ func singboxToMapping(o map[string]any) (map[string]any, bool) {
 		// sing-box calls it "shadowsocks"; mihomo (and the goose protocol
 		// names this plugin registers) call it "ss".
 		mihomoType = "ss"
+	case "shadowtls", "tor", "hysteria", "hysteria2", "tuic":
+		// mihomo has no schema for these: keep the sing-box shape — the raw
+		// object is stashed below and the converters read it back
+		// losslessly, while the common fields still copy out for ServerKey
+		// and display. ProtocolOf gates the build tags: without with_quic
+		// the QUIC types are not dialable and are skipped here.
+		if _, ok := ProtocolOf(map[string]any{"type": typ}); !ok {
+			return nil, false
+		}
+		mihomoType = typ
 	default:
 		return nil, false
 	}
@@ -332,6 +352,13 @@ func singboxToMapping(o map[string]any) (map[string]any, bool) {
 				m["ws-opts"] = map[string]any{"path": path}
 			}
 		}
+	}
+	// Native pass-through for the types mihomo has no schema for: the raw
+	// object rides along under "options"; the converters prefer it and fall
+	// back to the fields copied above.
+	switch typ {
+	case "shadowtls", "tor", "hysteria", "hysteria2", "tuic":
+		m["options"] = o
 	}
 	return m, true
 }

@@ -3,6 +3,8 @@ package singbox
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/sagernet/sing-box/option"
 )
 
 // TestParseSubscriptionSingboxJSON verifies the native sing-box config path:
@@ -119,12 +121,103 @@ func TestParseSubscriptionSingboxJSONMinimal(t *testing.T) {
 }
 
 // TestSingboxToMappingSkipsNonDialable verifies group and abstract outbound
-// types are excluded.
+// types are excluded, and that the QUIC types pass through exactly when this
+// build can dial them.
 func TestSingboxToMappingSkipsNonDialable(t *testing.T) {
-	for _, typ := range []string{"selector", "urltest", "direct", "dns", "block", "hysteria2", "wireguard"} {
+	for _, typ := range []string{"selector", "urltest", "direct", "dns", "block", "wireguard", "masque"} {
 		if _, ok := singboxToMapping(map[string]any{"type": typ, "tag": typ}); ok {
 			t.Fatalf("type %q should be skipped", typ)
 		}
+	}
+	for _, typ := range []string{"hysteria", "hysteria2", "tuic"} {
+		if _, ok := singboxToMapping(map[string]any{"type": typ, "tag": typ}); ok != quicSupported(typ) {
+			t.Fatalf("type %q: singboxToMapping ok=%v, want %v (with_quic=%v)", typ, ok, quicSupported(typ), quicSupported(typ))
+		}
+	}
+}
+
+// TestProtocolOfGating checks the dialability gates: always-compiled types
+// are accepted, QUIC types only in with_quic builds, unknown types never —
+// in both the mihomo and the native (sing-box name) spellings.
+func TestProtocolOfGating(t *testing.T) {
+	for _, typ := range []string{"shadowtls", "tor"} {
+		if p, ok := ProtocolOf(map[string]any{"type": typ, "server": "10.0.0.1", "port": 443}); !ok || p != "singbox-"+typ {
+			t.Fatalf("%s: ProtocolOf = %q ok=%v", typ, p, ok)
+		}
+	}
+	for _, typ := range []string{"hysteria", "hysteria2", "tuic"} {
+		p, ok := ProtocolOf(map[string]any{"type": typ, "server": "10.0.0.1", "port": 443})
+		if ok != quicSupported(typ) {
+			t.Fatalf("%s: ProtocolOf = %q ok=%v, want ok=%v", typ, p, ok, quicSupported(typ))
+		}
+	}
+	for _, typ := range []string{"ssr", "socks4", "wireguard", "mieru", "masque", ""} {
+		if p, ok := ProtocolOf(map[string]any{"type": typ}); ok {
+			t.Fatalf("type %q: ProtocolOf = %q, want rejected", typ, p)
+		}
+	}
+}
+
+// TestParseSubscriptionSingboxJSONNativeTypes verifies the native
+// pass-through dialect: shadowtls/tor entries keep the raw sing-box object
+// under "options" and still convert into typed options.
+func TestParseSubscriptionSingboxJSONNativeTypes(t *testing.T) {
+	body := []byte(`{"outbounds": [
+	  {"tag": "stls", "type": "shadowtls", "server": "stls.example.com", "server_port": 443,
+	   "version": 3, "password": "pw", "tls": {"enabled": true, "server_name": "cover.example.com"}},
+	  {"tag": "tor-daemon", "type": "tor", "executable_path": "/usr/bin/tor", "torrc": {"SocksPort": "9050"}}
+	]}`)
+	mappings, err := ParseSubscription(body)
+	if err != nil {
+		t.Fatalf("ParseSubscription: %v", err)
+	}
+	if len(mappings) != 2 {
+		t.Fatalf("want 2 mappings, got %d: %+v", len(mappings), mappings)
+	}
+	var stls, tor map[string]any
+	for _, m := range mappings {
+		switch m["type"] {
+		case "shadowtls":
+			stls = m
+		case "tor":
+			tor = m
+		}
+	}
+	if stls == nil || tor == nil {
+		t.Fatalf("missing mapping: stls=%v tor=%v", stls != nil, tor != nil)
+	}
+	// Common fields copy out for ServerKey/display...
+	if stls["server"] != "stls.example.com" || stls["port"] != 443 || stls["name"] != "stls" {
+		t.Fatalf("shadowtls mapping = %+v", stls)
+	}
+	// ...and the raw object rides along for exact conversion.
+	opts, ok := stls["options"].(map[string]any)
+	if !ok || opts["password"] != "pw" || opts["version"] != float64(3) {
+		t.Fatalf("shadowtls options = %#v", stls["options"])
+	}
+	if _, ok := ProtocolOf(stls); !ok {
+		t.Fatal("shadowtls not dialable")
+	}
+	if _, ok := ProtocolOf(tor); !ok {
+		t.Fatal("tor not dialable")
+	}
+	converted, err := convertMapping("shadowtls", stls)
+	if err != nil {
+		t.Fatalf("convertMapping: %v", err)
+	}
+	o := converted.(*option.ShadowTLSOutboundOptions)
+	if o.Server != "stls.example.com" || o.ServerPort != 443 || o.Version != 3 || o.Password != "pw" {
+		t.Fatalf("shadowtls opts = %+v", o)
+	}
+	if o.TLS == nil || !o.TLS.Enabled || o.TLS.ServerName != "cover.example.com" {
+		t.Fatalf("shadowtls tls = %+v", o.TLS)
+	}
+	// serverAddr reads either dialect; tor has no server address.
+	if got := serverAddr(stls); got != "stls.example.com:443" {
+		t.Fatalf("shadowtls serverAddr = %q", got)
+	}
+	if got := serverAddr(tor); got != "" {
+		t.Fatalf("tor serverAddr = %q, want empty", got)
 	}
 }
 

@@ -1,11 +1,17 @@
-// convert.go converts mihomo proxy mappings into sing-box outbound option
-// structs. The field names follow mihomo's `proxy:` struct tags (server, port,
-// uuid, cipher, ws-opts, ...) and sing-box's option structs (Server,
-// ServerPort, UUID, Security, Transport), so a subscription parsed by
-// mihomo's converters can be dialed by sing-box's protocol implementations.
+// convert.go converts proxy mappings into sing-box outbound option structs.
+// The field names follow mihomo's `proxy:` struct tags (server, port, uuid,
+// cipher, ws-opts, ...) and sing-box's option structs (Server, ServerPort,
+// UUID, Security, Transport), so a subscription parsed by mihomo's converters
+// can be dialed by sing-box's protocol implementations.
+//
+// For the types mihomo has no field names for — tor, shadowtls, and every
+// field mihomo's schema lacks (torrc, port hopping, QUIC tuning) — the
+// mapping instead carries the raw sing-box options object under "options",
+// decoded with sing's own json unmarshalers.
 package singbox
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -38,9 +44,34 @@ func convertMapping(sbType string, m map[string]any) (any, error) {
 		return convertSSH(m), nil
 	case "anytls":
 		return convertAnyTLS(m), nil
+	case "shadowtls":
+		return convertShadowTLS(m)
+	case "tor":
+		return convertTor(m)
+	case "hysteria", "hysteria2", "tuic":
+		return convertQuic(sbType, m)
 	default:
 		return nil, fmt.Errorf("unsupported type %q", sbType)
 	}
+}
+
+// nativeOptions decodes the raw sing-box options object (m["options"]) into
+// dst, using sing's json unmarshalers for the badoption-typed fields. It
+// returns ok=false when the mapping has no options object — the mihomo field
+// dialect, which each converter handles field by field.
+func nativeOptions(m map[string]any, dst any) (bool, error) {
+	raw, ok := m["options"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return true, err
+	}
+	if err := json.Unmarshal(b, dst); err != nil {
+		return true, fmt.Errorf("native options: %w", err)
+	}
+	return true, nil
 }
 
 // server fills the embedded ServerOptions.
@@ -246,6 +277,56 @@ func convertAnyTLS(m map[string]any) *option.AnyTLSOutboundOptions {
 		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: tlsOptions(m)},
 		Password:                    mappingStr(m, "password"),
 	}
+}
+
+// convertShadowTLS: the protocol's whole purpose is a real TLS handshake to
+// the cover server, so the container is always set. The field-based dialect
+// accepts the flattened mihomo-style keys; everything else goes through the
+// native options object.
+func convertShadowTLS(m map[string]any) (*option.ShadowTLSOutboundOptions, error) {
+	var native option.ShadowTLSOutboundOptions
+	if ok, err := nativeOptions(m, &native); err != nil {
+		return nil, err
+	} else if ok {
+		return &native, nil
+	}
+	version := mappingInt(m, "version")
+	if version < 1 || version > 3 {
+		return nil, fmt.Errorf("unsupported shadowtls version %d", version)
+	}
+	return &option.ShadowTLSOutboundOptions{
+		ServerOptions:               server(m),
+		Version:                     version,
+		Password:                    mappingStr(m, "password"),
+		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: tlsOptions(m)},
+	}, nil
+}
+
+// convertTor: mihomo has no tor proxy type, so the field-based dialect is
+// this plugin's own flattened spelling of the sing-box options (static
+// configs use it or the native "options" object). A tor outbound dials
+// through a local tor daemon, so there is no server address.
+func convertTor(m map[string]any) (*option.TorOutboundOptions, error) {
+	var native option.TorOutboundOptions
+	if ok, err := nativeOptions(m, &native); err != nil {
+		return nil, err
+	} else if ok {
+		return &native, nil
+	}
+	opts := &option.TorOutboundOptions{
+		ExecutablePath: mappingStr(m, "executable-path"),
+		DataDirectory:  mappingStr(m, "data-directory"),
+		ExtraArgs:      mappingStrings(m, "extra-args"),
+	}
+	if torrc, ok := m["torrc"].(map[string]any); ok {
+		opts.Options = make(map[string]string, len(torrc))
+		for k, v := range torrc {
+			if s, ok := v.(string); ok {
+				opts.Options[k] = s
+			}
+		}
+	}
+	return opts, nil
 }
 
 // mappingBool reads a bool field (JSON booleans survive YAML parsing as bool).

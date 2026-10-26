@@ -177,6 +177,39 @@ func TestConvertMapping(t *testing.T) {
 				t.Fatalf("anytls opts = %+v", o)
 			}
 		}},
+		{"shadowtls", map[string]any{"server": "10.0.0.10", "port": 443, "version": 3, "password": "pw"}, func(t *testing.T, opts any) {
+			o := opts.(*option.ShadowTLSOutboundOptions)
+			if o.Version != 3 || o.Password != "pw" || o.TLS == nil || !o.TLS.Enabled {
+				t.Fatalf("shadowtls opts = %+v", o)
+			}
+		}},
+		{"shadowtls", map[string]any{"type": "shadowtls", "options": map[string]any{"server": "10.0.0.11", "server_port": 8443, "version": 2, "password": "pw2"}}, func(t *testing.T, opts any) {
+			o := opts.(*option.ShadowTLSOutboundOptions)
+			if o.Server != "10.0.0.11" || o.ServerPort != 8443 || o.Version != 2 || o.Password != "pw2" {
+				t.Fatalf("shadowtls native opts = %+v", o)
+			}
+		}},
+		{"tor", map[string]any{"executable-path": "/usr/bin/tor", "data-directory": "/var/lib/tor", "torrc": map[string]any{"SocksPort": "9050"}}, func(t *testing.T, opts any) {
+			o := opts.(*option.TorOutboundOptions)
+			if o.ExecutablePath != "/usr/bin/tor" || o.DataDirectory != "/var/lib/tor" {
+				t.Fatalf("tor opts = %+v", o)
+			}
+			if o.Options["SocksPort"] != "9050" {
+				t.Fatalf("tor torrc = %v", o.Options)
+			}
+		}},
+		{"tor", map[string]any{"type": "tor", "options": map[string]any{"executable_path": "/usr/local/bin/tor", "extra_args": []any{"--SocksPort", "9150"}}, "torrc": map[string]any{"ignored": "yes"}}, func(t *testing.T, opts any) {
+			o := opts.(*option.TorOutboundOptions)
+			if o.ExecutablePath != "/usr/local/bin/tor" {
+				t.Fatalf("tor native path = %+v", o)
+			}
+			if len(o.ExtraArgs) != 2 || o.ExtraArgs[0] != "--SocksPort" {
+				t.Fatalf("tor native extra args = %v", o.ExtraArgs)
+			}
+			if len(o.Options) != 0 {
+				t.Fatalf("native options must win over fields: %v", o.Options)
+			}
+		}},
 	}
 	for _, tc := range cases {
 		opts, err := convertMapping(tc.sbType, tc.m)
