@@ -87,7 +87,7 @@ func newOutboundFactory(typ string) pub.OutboundFactory {
 			return nil, fmt.Errorf("singbox %s outbound: missing proxy mapping or options", typ)
 		}
 		id, _ := cfg["id"].(string)
-		return &Outbound{id: id, proto: "singbox-" + typ, mapping: raw}, nil
+		return &Outbound{id: id, proto: "singbox-" + typ, mapping: raw, stack: pub.AsStackDialer(cfg)}, nil
 	}
 }
 
@@ -117,6 +117,11 @@ type Outbound struct {
 	id      string
 	proto   string
 	mapping map[string]any
+	// stack is the engine's network-stack dialer injected into the config
+	// map (StackDialerKey, "_dialer"). Non-nil means the proxy's own
+	// connection to its server dials through the engine stack — see
+	// stack.go — instead of sing-box's kernel dialer.
+	stack pub.StackDialer
 
 	once   sync.Once
 	sb     adapter.Outbound
@@ -137,6 +142,16 @@ func (o *Outbound) ensure() error {
 		if err != nil {
 			o.buildE = fmt.Errorf("singbox outbound: convert %s: %w", o.proto, err)
 			return
+		}
+		// Route the proxy's connection to its server through the engine's
+		// network stack when the engine injected one (stack.go detours the
+		// options through the shared bridge outbound). QUIC protocols keep
+		// their kernel dials — see stack.go's package comment.
+		if o.stack != nil && !quicSupported(sbType) {
+			if err := routeThroughEngineStack(o.stack, opts); err != nil {
+				o.buildE = err
+				return
+			}
 		}
 		sb, err := includeOutboundRegistry().CreateOutbound(ctx, nil, log.NewNOPFactory().NewLogger("outbound/"+sbType), o.id, sbType, opts)
 		if err != nil {

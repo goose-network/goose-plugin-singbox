@@ -112,8 +112,31 @@ func NewProvider(cfg map[string]any) (pub.Provider, error) {
 	return &Provider{
 		url:    u,
 		prefix: prefix,
-		client: &http.Client{Timeout: fetchTimeout},
+		client: fetchClient(cfg),
 	}, nil
+}
+
+// fetchClient builds the subscription-download HTTP client from the
+// engine-injected dialers. An engine-resolved upstream (UpstreamDialerKey,
+// injected when the provider spec names an upstream_proxy) outranks
+// everything; otherwise the engine's stack dialer (StackDialerKey, always
+// injected on the provider side) governs the transport, so the download
+// rides the engine's network stack instead of a bare socket. With neither,
+// a plain client — the standalone case.
+func fetchClient(cfg map[string]any) *http.Client {
+	if ud := pub.AsUpstreamDialer(cfg); ud != nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.Proxy = nil // the upstream dialer is the route
+		tr.DialContext = ud.DialUpstream
+		return &http.Client{Transport: tr, Timeout: fetchTimeout}
+	}
+	if sd := pub.AsStackDialer(cfg); sd != nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.Proxy = nil
+		tr.DialContext = sd.Dial
+		return &http.Client{Transport: tr, Timeout: fetchTimeout}
+	}
+	return &http.Client{Timeout: fetchTimeout}
 }
 
 // Name identifies the plugin.
@@ -404,6 +427,16 @@ var (
 	// boxOutboundRegistry is the outbound registry installed in boxCtx. It is
 	// assigned by buildBoxContext and read by the outbound factory.
 	boxOutboundRegistry adapter.OutboundRegistry
+
+	// boxOutboundManager is the shared outbound manager in boxCtx. It is
+	// assigned by buildBoxContext; stack.go adds the engine-stack bridge
+	// outbound to it so sing-box's detour dialer can resolve the bridge's
+	// tag.
+	boxOutboundManager *boxOutbound.Manager
+	// boxRouter is the route Router registered in boxCtx. The engine-stack
+	// bridge outbound is created with it (the type itself ignores routers —
+	// it only dials the engine's stack).
+	boxRouter adapter.Router
 )
 
 func getBoxContext() (context.Context, error) {
@@ -422,6 +455,11 @@ func buildBoxContext() error {
 	ctx := context.Background()
 	outboundRegistry := include.OutboundRegistry()
 	dnsTransportRegistry := include.DNSTransportRegistry()
+	// The engine-stack bridge rides along on this exact registry instance
+	// (stack.go): include.OutboundRegistry() builds a fresh registry per
+	// call, so registering after include.Context captures its own would
+	// strand the bridge on an instance nothing reads.
+	registerEngineStackOutbound(outboundRegistry)
 	ctx = include.Context(ctx)
 	ctx = service.ContextWithDefaultRegistry(ctx)
 	ctx = pause.WithDefaultManager(ctx)
@@ -460,7 +498,7 @@ func buildBoxContext() error {
 	// nil router. The HTTP client manager is a Router dependency.
 	httpClientManager := httpclient.NewManager(ctx, logFactory.NewLogger("httpclient"), nil, "")
 	service.MustRegister[adapter.HTTPClientManager](ctx, httpClientManager)
-	boxRouter := route.NewRouter(ctx, logFactory, option.RouteOptions{}, option.DNSOptions{})
+	boxRouter = route.NewRouter(ctx, logFactory, option.RouteOptions{}, option.DNSOptions{})
 	service.MustRegister[adapter.Router](ctx, boxRouter)
 
 	// Default-outbound and local-DNS fallbacks, mirroring box.New: they are
@@ -497,8 +535,10 @@ func buildBoxContext() error {
 
 	// Export the registry the outbound factory dials through. include.Context
 	// installed the same instance in the context; the local reference avoids a
-	// service.FromContext lookup on every build.
+	// service.FromContext lookup on every build. The manager and router back
+	// stack.go's bridge creation.
 	boxOutboundRegistry = outboundRegistry
+	boxOutboundManager = outboundManager
 
 	boxCtx = ctx
 	return nil
