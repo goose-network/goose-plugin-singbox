@@ -87,7 +87,11 @@ func newOutboundFactory(typ string) pub.OutboundFactory {
 			return nil, fmt.Errorf("singbox %s outbound: missing proxy mapping or options", typ)
 		}
 		id, _ := cfg["id"].(string)
-		return &Outbound{id: id, proto: "singbox-" + typ, mapping: raw, stack: pub.AsStackDialer(cfg)}, nil
+		return &Outbound{
+			id: id, proto: "singbox-" + typ, mapping: raw,
+			stack:    pub.AsStackDialer(cfg),
+			upstream: pub.AsUpstreamDialer(cfg),
+		}, nil
 	}
 }
 
@@ -122,6 +126,12 @@ type Outbound struct {
 	// connection to its server dials through the engine stack — see
 	// stack.go — instead of sing-box's kernel dialer.
 	stack pub.StackDialer
+	// upstream is the engine's upstream-route dialer injected into the
+	// config map (UpstreamDialerKey, "_upstream_dialer") when the outbound
+	// spec's upstream_proxy names an engine route. Non-nil outranks stack:
+	// the server connection tunnels through the route (stack.go's bridge)
+	// and the stack detour is skipped.
+	upstream pub.UpstreamDialer
 
 	once   sync.Once
 	sb     adapter.Outbound
@@ -143,14 +153,22 @@ func (o *Outbound) ensure() error {
 			o.buildE = fmt.Errorf("singbox outbound: convert %s: %w", o.proto, err)
 			return
 		}
-		// Route the proxy's connection to its server through the engine's
-		// network stack when the engine injected one (stack.go detours the
-		// options through the shared bridge outbound). QUIC protocols keep
-		// their kernel dials — see stack.go's package comment.
-		if o.stack != nil && !quicSupported(sbType) {
-			if err := routeThroughEngineStack(o.stack, opts); err != nil {
-				o.buildE = err
-				return
+		// Route the proxy's connection to its server through the engine: an
+		// injected upstream route (stack.go's per-outbound bridge) outranks
+		// the stack detour; without a route, the engine stack applies when
+		// injected. QUIC protocols keep their kernel dials in both cases —
+		// see stack.go's package comment.
+		if !quicSupported(sbType) {
+			if o.upstream != nil {
+				if err := routeThroughEngineUpstream(o.upstream, engineUpstreamTag(o.id), opts); err != nil {
+					o.buildE = err
+					return
+				}
+			} else if o.stack != nil {
+				if err := routeThroughEngineStack(o.stack, opts); err != nil {
+					o.buildE = err
+					return
+				}
 			}
 		}
 		sb, err := includeOutboundRegistry().CreateOutbound(ctx, nil, log.NewNOPFactory().NewLogger("outbound/"+sbType), o.id, sbType, opts)

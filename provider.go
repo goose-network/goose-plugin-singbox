@@ -455,11 +455,12 @@ func buildBoxContext() error {
 	ctx := context.Background()
 	outboundRegistry := include.OutboundRegistry()
 	dnsTransportRegistry := include.DNSTransportRegistry()
-	// The engine-stack bridge rides along on this exact registry instance
-	// (stack.go): include.OutboundRegistry() builds a fresh registry per
-	// call, so registering after include.Context captures its own would
-	// strand the bridge on an instance nothing reads.
+	// The engine-stack and engine-upstream bridges ride along on this exact
+	// registry instance (stack.go): include.OutboundRegistry() builds a
+	// fresh registry per call, so registering after include.Context captures
+	// its own would strand the bridges on an instance nothing reads.
 	registerEngineStackOutbound(outboundRegistry)
+	registerEngineUpstreamOutbound(outboundRegistry)
 	ctx = include.Context(ctx)
 	ctx = service.ContextWithDefaultRegistry(ctx)
 	ctx = pause.WithDefaultManager(ctx)

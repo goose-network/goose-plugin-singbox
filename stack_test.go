@@ -243,6 +243,192 @@ func TestOutboundFactoryConsumesStackDialer(t *testing.T) {
 	}
 }
 
+// fakeUpstreamDialer is a pub.UpstreamDialer that records DialUpstream calls
+// and returns a net.Pipe connection, so a test observes the destinations an
+// outbound routes through the engine with no real socket. onConn, when set,
+// runs on the pipe's peer end and plays the server beyond the route (the
+// handshake to the upstream is the engine's business; the fake only stands
+// in for the tunnel DialUpstream returns).
+type fakeUpstreamDialer struct {
+	mu       sync.Mutex
+	dials    []string
+	networks []string
+	onConn   func(net.Conn)
+}
+
+func (f *fakeUpstreamDialer) DialUpstream(ctx context.Context, network, address string) (net.Conn, error) {
+	f.mu.Lock()
+	f.dials = append(f.dials, address)
+	f.networks = append(f.networks, network)
+	f.mu.Unlock()
+	c1, c2 := net.Pipe()
+	if f.onConn != nil {
+		go f.onConn(c2)
+	} else {
+		go func() {
+			<-ctx.Done()
+			_ = c2.Close()
+		}()
+	}
+	return c1, nil
+}
+
+// TestEngineUpstreamOutboundDials verifies the route bridge itself: a dial
+// is a DialUpstream to the same destination, and a domain destination is
+// passed to the route unresolved (the engine route resolves it).
+func TestEngineUpstreamOutboundDials(t *testing.T) {
+	fu := &fakeUpstreamDialer{}
+	o, err := newEngineUpstreamOutbound(context.Background(), nil, nil, engineUpstreamTag("test"), engineUpstreamDialerOptions{Dialer: fu})
+	if err != nil {
+		t.Fatalf("newEngineUpstreamOutbound: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := o.DialContext(ctx, "tcp", M.ParseSocksaddr("example.com:443"))
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	_ = conn.Close()
+
+	fu.mu.Lock()
+	dials, networks := append([]string{}, fu.dials...), append([]string{}, fu.networks...)
+	fu.mu.Unlock()
+	if len(dials) != 1 || dials[0] != "example.com:443" {
+		t.Fatalf("engine route dialed %v, want [example.com:443]", dials)
+	}
+	if len(networks) != 1 || networks[0] != "tcp" {
+		t.Fatalf("engine route networks = %v, want [tcp]", networks)
+	}
+}
+
+// TestEngineUpstreamOutboundNilDialer verifies the constructor refuses a
+// bridge with no route dialer — a bridge like that would nil-panic on the
+// first dial instead of failing the outbound's build.
+func TestEngineUpstreamOutboundNilDialer(t *testing.T) {
+	if _, err := newEngineUpstreamOutbound(context.Background(), nil, nil, engineUpstreamTag("x"), engineUpstreamDialerOptions{}); err == nil {
+		t.Fatal("bridge creation without a route dialer unexpectedly succeeded")
+	}
+}
+
+// TestEngineUpstreamOutboundListenPacketRefusedOnNonPacketConn verifies the
+// packet path fails loudly when the route returns a stream (net.Pipe never
+// implements net.PacketConn), the same contract as the stack bridge.
+func TestEngineUpstreamOutboundListenPacketRefusedOnNonPacketConn(t *testing.T) {
+	fu := &fakeUpstreamDialer{}
+	o, err := newEngineUpstreamOutbound(context.Background(), nil, nil, engineUpstreamTag("pkt"), engineUpstreamDialerOptions{Dialer: fu})
+	if err != nil {
+		t.Fatalf("newEngineUpstreamOutbound: %v", err)
+	}
+	if _, err := o.ListenPacket(context.Background(), M.ParseSocksaddr("10.9.8.7:443")); err == nil {
+		t.Fatal("ListenPacket over a non-packet conn unexpectedly succeeded")
+	}
+}
+
+// TestEngineUpstreamTag verifies the per-outbound bridge tag derivation: the
+// outbound id suffixes the bridge type, and a rebuilt outbound derives the
+// same tag so the manager replaces its old bridge.
+func TestEngineUpstreamTag(t *testing.T) {
+	if got := engineUpstreamTag("a1"); got != "goose-engine-upstream-a1" {
+		t.Errorf("engineUpstreamTag(a1) = %q, want goose-engine-upstream-a1", got)
+	}
+}
+
+// TestOutboundFactoryConsumesRouteDialer verifies the factory
+// type-asserts the engine-injected route dialer out of the config map.
+func TestOutboundFactoryConsumesRouteDialer(t *testing.T) {
+	factory, ok := pub.Lookup("singbox-socks")
+	if !ok {
+		t.Fatal("singbox-socks not registered")
+	}
+	base := map[string]any{
+		"id":    "route-1",
+		"proxy": map[string]any{"type": "socks5", "server": "10.9.8.7", "port": 1080},
+	}
+	o, err := factory(base)
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+	if o.(*Outbound).upstream != nil {
+		t.Fatal("route dialer present without injection")
+	}
+
+	withRoute := map[string]any{
+		"id":               "route-2",
+		"proxy":            base["proxy"],
+		"_upstream_dialer": &fakeUpstreamDialer{},
+	}
+	o, err = factory(withRoute)
+	if err != nil {
+		t.Fatalf("factory (with route): %v", err)
+	}
+	if o.(*Outbound).upstream == nil {
+		t.Fatal("injected route dialer not consumed")
+	}
+}
+
+// TestOutboundDialsThroughEngineRoute is the behavioral proof: a dial
+// through a singbox-socks outbound whose spec names an engine route must
+// reach the proxy's server through the per-outbound bridge — and when a
+// stack dialer is injected alongside, the route outranks it, so the stack
+// records nothing. The fake route hands back a pipe whose peer completes
+// the SOCKS5 handshake, so the dial succeeding proves the proxy's greeting
+// and CONNECT bytes traversed the detour bridge and the engine route — no
+// socket sing-box owns is ever opened.
+func TestOutboundDialsThroughEngineRoute(t *testing.T) {
+	fs := &fakeStackDialer{}
+	fu := &fakeUpstreamDialer{onConn: serveSocks5NoAuth}
+	factory, ok := pub.Lookup("singbox-socks")
+	if !ok {
+		t.Fatal("singbox-socks not registered")
+	}
+	o, err := factory(map[string]any{
+		"id": "route-dial",
+		"proxy": map[string]any{
+			"type":   "socks5",
+			"name":   "route-dial-test",
+			"server": "10.9.8.7",
+			"port":   1080,
+		},
+		"_dialer":          fs,
+		"_upstream_dialer": fu,
+	})
+	if err != nil {
+		t.Fatalf("factory: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	conn, err := o.DialContext(ctx, pub.NetworkTCP, "example.com:80")
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	defer conn.Close()
+
+	// The route must have been consulted exactly once, for the proxy's own
+	// server address, over TCP.
+	fu.mu.Lock()
+	dials, networks := append([]string{}, fu.dials...), append([]string{}, fu.networks...)
+	fu.mu.Unlock()
+	if len(dials) != 1 {
+		t.Fatalf("engine route dialed %d times, want 1: %v", len(dials), dials)
+	}
+	if dials[0] != "10.9.8.7:1080" {
+		t.Fatalf("engine route dialed %q, want the proxy server 10.9.8.7:1080", dials[0])
+	}
+	if len(networks) != 1 || networks[0] != "tcp" {
+		t.Fatalf("engine route networks = %v, want [tcp]", networks)
+	}
+	// The stack, injected alongside, must never have been dialed.
+	fs.mu.Lock()
+	stackDials := append([]string{}, fs.dials...)
+	fs.mu.Unlock()
+	if len(stackDials) != 0 {
+		t.Fatalf("engine stack dialed %v, want none — the route outranks the stack detour", stackDials)
+	}
+}
+
 // TestOutboundDialsThroughEngineStack is the behavioral proof: a dial
 // through a singbox-socks outbound must reach the proxy's server via the
 // engine-injected stack dialer. The fake stack hands back a pipe whose
