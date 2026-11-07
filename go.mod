@@ -19,10 +19,10 @@ go 1.26.0
 toolchain go1.26.8
 
 require (
-	github.com/goose-network/goose-plugin-api v0.0.0
-	github.com/metacubex/mihomo v0.0.0
+	github.com/goose-network/goose-plugin-api v0.0.1
+	github.com/metacubex/mihomo v0.0.0-20260922124647-afe94dafef8c
 	github.com/sagernet/sing v0.9.6-0.20260922013359-4ca3bebe0b8e
-	github.com/sagernet/sing-box v0.0.0
+	github.com/sagernet/sing-box v0.0.0-20260922113237-e5e705ed802d
 )
 
 require (
@@ -226,13 +226,3 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
-
-// Local checkouts: the api module, mihomo (link parsing) and sing-box live
-// as sibling repos under /home/ubuntu/Downloads/proxy. These replaces make
-// the plugin build against the local sources rather than (nonexistent)
-// published versions.
-replace github.com/goose-network/goose-plugin-api => ../goose-plugin-api
-
-replace github.com/metacubex/mihomo => ../mihomo
-
-replace github.com/sagernet/sing-box => ../sing-box
